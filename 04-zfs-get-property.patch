@@ -1,0 +1,11 @@
+--- vendor/src/github.com/mistifyio/go-zfs/zfs.go
++++ vendor/src/github.com/mistifyio/go-zfs/zfs.go
+@@ -259,7 +259,7 @@
+ // A full list of available ZFS properties may be found here:
+ // https://www.freebsd.org/cgi/man.cgi?zfs(8).
+ func (d *Dataset) GetProperty(key string) (string, error) {
+-	out, err := zfs("get", key, d.Name)
++	out, err := zfs("get", "-Hp", key, d.Name)
+ 	if err != nil {
+ 		return "", err
+ 	}

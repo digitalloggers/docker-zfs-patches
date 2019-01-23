@@ -1,0 +1,209 @@
+--- daemon/graphdriver/zfs/zfs.go
++++ daemon/graphdriver/zfs/zfs.go
+@@ -19,6 +19,10 @@ import (
+ 	"github.com/docker/docker/pkg/mount"
+ 	"github.com/docker/docker/pkg/parsers"
+ 	zfs "github.com/mistifyio/go-zfs"
++	"github.com/docker/docker/pkg/archive"
++	"github.com/docker/docker/pkg/chrootarchive"
++	"github.com/docker/docker/pkg/ioutils"
++	"path/filepath"
+ )
+ 
+ type ZfsOptions struct {
+@@ -99,7 +103,7 @@ func Init(base string, opt []string) (graphdriver.Driver, error) {
+ 		filesystemsCache: filesystemsCache,
+ 		mountedFs:        mountedFs,
+ 	}
+-	return graphdriver.NaiveDiffDriver(d), nil
++	return d, nil
+ }
+ 
+ func parseOptions(opt []string) (ZfsOptions, error) {
+@@ -352,3 +356,185 @@ func (d *Driver) Put(id string) error {
+ func (d *Driver) Exists(id string) bool {
+ 	return d.filesystemsCache[d.ZfsPath(id)] == true
+ }
++
++func (d *Driver) Diff(id, parent string) (archive.Archive, error) {
++	log.Debugf("[zfs] diffing %s to %s", id, parent)
++	layerFs, err := d.Get(id, "")
++	if err != nil {
++		return nil, err
++	}
++
++	defer func() {
++		if err != nil {
++			d.Put(id)
++		}
++	}()
++
++	if parent == "" {
++		log.Debugf("[zfs] creating archive from scratch")
++		archive, err := archive.Tar(layerFs, archive.Uncompressed)
++		if err != nil {
++			return nil, err
++		}
++		return ioutils.NewReadCloserWrapper(archive, func() error {
++			err := archive.Close()
++			d.Put(id)
++			log.Debugf("[zfs] done diffing %s", id)
++			return err
++		}), nil
++	}
++
++	log.Debugf("[zfs] starting comparing %s", id)
++	name := d.ZfsPath(id)
++	dataset := zfs.Dataset{Name: name}
++
++	// XXX: for no apparent reason whatsoever, ZFS wants us to have the parent mounted
++	parentFs, err := d.Get(parent, "")
++	if err != nil {
++		return nil, err
++	}
++	defer d.Put(parent)
++
++	origin, err := dataset.GetProperty("origin")
++	if err != nil {
++		return nil, fmt.Errorf("error getting origin of %s: %v", id, parent, err)
++	}
++	inodeChanges, err := dataset.Diff(origin)
++	if err != nil {
++		return nil, fmt.Errorf("error comparing %s to %s: %v", id, parent, err)
++	}
++
++	var changes []archive.Change
++	for _, ic := range inodeChanges {
++		path,err := filepath.Rel(layerFs,ic.Path)
++		if err != nil {
++			return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.Path, parentFs, err)
++		}
++		ic.Path="/"+path
++		if ic.NewPath!="" {
++			newpath,err := filepath.Rel(layerFs,ic.NewPath)
++			if err != nil {
++				return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.NewPath, parentFs, err)
++			}
++			ic.NewPath="/"+newpath
++		}
++		switch ic.Change {
++		case zfs.Created:
++			changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeAdd})
++		case zfs.Removed:
++			changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
++		case zfs.Modified:
++			changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeModify})
++		case zfs.Renamed:
++			changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
++			changes=append(changes,archive.Change{Path:ic.NewPath,Kind:archive.ChangeAdd})
++		}
++	}
++	log.Debugf("[zfs] done comparing %s", id)
++	archive, err := archive.ExportChanges(layerFs, changes)
++	if err != nil {
++		return nil, err
++	}
++	log.Debugf("[zfs] done exporting changes to %s", id)
++
++	return ioutils.NewReadCloserWrapper(archive, func() error {
++		err := archive.Close()
++		d.Put(id)
++		log.Debugf("[zfs] done diffing %s", id)
++		return err
++	}), nil
++}
++
++func (d *Driver) Changes(id, parent string) ([]archive.Change, error) {
++	log.Debugf("[zfs] comparing %s to %s", id, parent)
++	layerFs, err := d.Get(id, "")
++	if err != nil {
++		return nil, err
++	}
++	defer d.Put(id)
++
++	if parent != "" {
++		name := d.ZfsPath(id)
++		dataset := zfs.Dataset{Name: name}
++
++		// XXX: for no apparent reason whatsoever, ZFS wants us to have the parent mounted
++		parentFs, err := d.Get(parent, "")
++		if err != nil {
++			return nil, err
++		}
++		defer d.Put(parent)
++
++		origin, err := dataset.GetProperty("origin")
++		if err != nil {
++			return nil, fmt.Errorf("error getting origin of %s: %v", id, err)
++		}
++		inodeChanges, err := dataset.Diff(origin)
++		if err != nil {
++			return nil, fmt.Errorf("error comparing %s to %s: %v", id, parent, err)
++		}
++
++		var changes []archive.Change
++		for _, ic := range inodeChanges {
++			path,err := filepath.Rel(layerFs,ic.Path)
++			if err != nil {
++				return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.Path, parentFs, err)
++			}
++			ic.Path="/"+path
++			if ic.NewPath!="" {
++				newpath,err := filepath.Rel(layerFs,ic.NewPath)
++				if err != nil {
++					return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.NewPath, parentFs, err)
++				}
++				ic.NewPath="/"+newpath
++			}
++			switch ic.Change {
++			case zfs.Created:
++				changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeAdd})
++			case zfs.Removed:
++				changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
++			case zfs.Modified:
++				changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeModify})
++			case zfs.Renamed:
++				changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
++				changes=append(changes,archive.Change{Path:ic.NewPath,Kind:archive.ChangeAdd})
++			}
++		}
++		log.Debugf("[zfs] done comparing %s", id)
++		return changes, nil
++	}
++	log.Debugf("[zfs] no parent, falling back to general case")
++
++	return archive.ChangesDirs(layerFs, "")
++}
++
++func (d *Driver) ApplyDiff(id, parent string, diff archive.ArchiveReader) (size int64, err error) {
++	layerFs, err := d.Get(id, "")
++	if err != nil {
++		return
++	}
++	defer d.Put(id)
++
++	start := time.Now().UTC()
++	log.Debugf("[zfs] start untar layer")
++	if size, err = chrootarchive.ApplyLayer(layerFs, diff); err != nil {
++		return
++	}
++	log.Debugf("[zfs] untar time: %vs", time.Now().UTC().Sub(start).Seconds())
++
++	return
++}
++
++func (d *Driver) DiffSize(id, parent string) (size int64, err error) {
++	changes, err := d.Changes(id, parent)
++	if err != nil {
++		return
++	}
++
++	layerFs, err := d.Get(id, "")
++	if err != nil {
++		return
++	}
++	defer d.Put(id)
++
++	return archive.ChangesSize(layerFs, changes), nil
++}
+

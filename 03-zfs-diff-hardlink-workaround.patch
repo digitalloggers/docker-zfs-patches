@@ -1,0 +1,377 @@
+Working around ZFS diff issue https://www.illumos.org/issues/1691: if a directory is affected, perform a shallow scan for changes in it to catch hard link updates.
+
+--- daemon/graphdriver/zfs/zfs.go
++++ daemon/graphdriver/zfs/zfs.go
+@@ -3,6 +3,7 @@
+ package zfs
+ 
+ import (
++	"bytes"
+ 	"fmt"
+ 	"os"
+ 	"os/exec"
+@@ -22,6 +23,7 @@ import (
+ 	"github.com/docker/docker/pkg/archive"
+ 	"github.com/docker/docker/pkg/chrootarchive"
+ 	"github.com/docker/docker/pkg/ioutils"
++	"github.com/docker/docker/pkg/system"
+ 	"path/filepath"
+ )
+ 
+@@ -357,38 +359,156 @@ func (d *Driver) Exists(id string) bool {
+ 	return d.filesystemsCache[d.ZfsPath(id)] == true
+ }
+ 
+-func (d *Driver) Diff(id, parent string) (archive.Archive, error) {
+-	log.Debugf("[zfs] diffing %s to %s", id, parent)
+-	layerFs, err := d.Get(id, "")
++type FileInfo struct {
++	stat       *system.Stat_t
++	capability []byte
++	added      bool
++}
++
++func shallowCollectFileOnlyInfo(sourceDir string) (map[string]*FileInfo, error) {
++	ret := make(map[string]*FileInfo)
++	err := filepath.Walk(sourceDir, func(path string, f os.FileInfo, err error) error {
++		if err != nil {
++			return err
++		}
++		relPath, err := filepath.Rel(sourceDir, path)
++		if err != nil {
++			return err
++		}
++		relPath = filepath.Join("/", relPath)
++		if relPath == "/" {
++			return nil
++		}
++		info := &FileInfo{}
++		s, err := system.Lstat(path)
++		if err != nil {
++			return err
++		}
++		if s.Mode()&syscall.S_IFDIR == syscall.S_IFDIR {
++			return filepath.SkipDir
++		}
++		info.stat = s
++		info.capability, _ = system.Lgetxattr(path, "security.capability")
++
++		ret[filepath.Base(relPath)]=info
++		return nil
++	})
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	return ret, nil
++}
+ 
+-	defer func() {
+-		if err != nil {
+-			d.Put(id)
+-		}
++func sameFsTimeSpec(a, b syscall.Timespec) bool {
++	return a.Sec == b.Sec &&
++		(a.Nsec == b.Nsec || a.Nsec == 0 || b.Nsec == 0)
++}
++
++func shallowFileOnlyChangesDirs(baseDir, newDir, oldDir string) ([]archive.Change, error) {
++	var changes []archive.Change
++	var (
++		oldData, newData map[string]*FileInfo
++		err1, err2       error
++		errs             = make(chan error, 2)
++	)
++	go func() {
++		oldData, err1 = shallowCollectFileOnlyInfo(oldDir)
++		errs <- err1
++	}()
++	go func() {
++		newData, err2 = shallowCollectFileOnlyInfo(newDir)
++		errs <- err2
+ 	}()
+ 
+-	if parent == "" {
+-		log.Debugf("[zfs] creating archive from scratch")
+-		archive, err := archive.Tar(layerFs, archive.Uncompressed)
+-		if err != nil {
++	// block until both routines have returned
++	for i := 0; i < 2; i++ {
++		if err := <-errs; err != nil {
+ 			return nil, err
+ 		}
+-		return ioutils.NewReadCloserWrapper(archive, func() error {
+-			err := archive.Close()
+-			d.Put(id)
+-			log.Debugf("[zfs] done diffing %s", id)
+-			return err
+-		}), nil
+ 	}
+ 
+-	log.Debugf("[zfs] starting comparing %s", id)
++	for oldName, oldChild := range(oldData) {
++		newChild := newData[oldName]
++		if newChild == nil {
++			changes = append(changes, archive.Change{Path:filepath.Join(baseDir,oldName),Kind:archive.ChangeDelete})
++		} else {
++			oldStat := oldChild.stat
++			newStat := newChild.stat
++			// Note: We can't compare inode or ctime or blocksize here, because these change
++			// when copying a file into a container. However, that is not generally a problem
++			// because any content change will change mtime, and any status change should
++			// be visible when actually comparing the stat fields. The only time this
++			// breaks down is if some code intentionally hides a change by setting
++			// back mtime
++			if oldStat.Mode() != newStat.Mode() ||
++				oldStat.Uid() != newStat.Uid() ||
++				oldStat.Gid() != newStat.Gid() ||
++				oldStat.Rdev() != newStat.Rdev() ||
++				// Don't look at size for dirs, its not a good measure of change
++				(oldStat.Mode()&syscall.S_IFDIR != syscall.S_IFDIR &&
++					(!sameFsTimeSpec(oldStat.Mtim(), newStat.Mtim()) || (oldStat.Size() != newStat.Size()))) ||
++				bytes.Compare(oldChild.capability, newChild.capability) != 0 {
++				changes = append(changes, archive.Change{Path: filepath.Join(baseDir,oldName), Kind: archive.ChangeModify})
++				newChild.added = true
++			}
++			delete(newData, oldName)
++		}
++	}
++	for newName, _ := range(newData) {
++		changes = append(changes, archive.Change{Path:filepath.Join(baseDir,newName),Kind:archive.ChangeAdd})
++	}
++	return changes, nil
++}
++
++func mergeChanges(target *[]archive.Change, changeMap *map[string]int, changes...archive.Change)  {
++	for _, change := range changes {
++		idx,present:=(*changeMap)[change.Path]
++		if present {
++			switch change.Kind {
++			case archive.ChangeAdd:
++				switch (*target)[idx].Kind {
++				case archive.ChangeAdd:
++					// NOTHING: identical
++				case archive.ChangeModify:
++					// XXX TODO: this indicates an inconsistency
++				case archive.ChangeDelete:
++					// Overwriting is modeled as modification
++					(*target)[idx].Kind = archive.ChangeModify
++				}
++			case archive.ChangeModify:
++				switch (*target)[idx].Kind {
++				case archive.ChangeAdd:
++					// NOTHING: a modified added file is still added
++				case archive.ChangeModify:
++					// NOTHING: identical
++				case archive.ChangeDelete:
++					// XXX TODO: this indicates an inconsistency
++					(*target)[idx].Kind = archive.ChangeModify
++				}
++			case archive.ChangeDelete:
++				switch (*target)[idx].Kind {
++				case archive.ChangeAdd:
++					// XXX TODO: make the change a no-op?
++					(*target)[idx].Kind = archive.ChangeDelete
++				case archive.ChangeModify:
++					// Even modified, the file is still deleted
++					(*target)[idx].Kind = archive.ChangeDelete
++				case archive.ChangeDelete:
++					// NOTHING: identical
++				}
++			}
++		} else {
++			(*changeMap)[change.Path]=len(*target)
++			*target=append(*target,change)
++		}
++	}
++}
++
++func (d *Driver) makeChangeList(id, layerFs, parent string) ([]archive.Change, error) {
++	log.Debugf("[zfs] comparing %s to %s", id, parent)
+ 	name := d.ZfsPath(id)
+ 	dataset := zfs.Dataset{Name: name}
+ 
+-	// XXX: for no apparent reason whatsoever, ZFS wants us to have the parent mounted
+ 	parentFs, err := d.Get(parent, "")
+ 	if err != nil {
+ 		return nil, err
+@@ -405,34 +525,102 @@ func (d *Driver) Diff(id, parent string) (archive.Archive, error) {
+ 	}
+ 
+ 	var changes []archive.Change
++	pathStateChangeIndex:=make(map[string]int)
+ 	for _, ic := range inodeChanges {
+ 		path,err := filepath.Rel(layerFs,ic.Path)
+ 		if err != nil {
+-			return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.Path, parentFs, err)
++			return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.Path, layerFs, err)
+ 		}
+-		ic.Path="/"+path
++		ic.Path=path
+ 		if ic.NewPath!="" {
+ 			newpath,err := filepath.Rel(layerFs,ic.NewPath)
+ 			if err != nil {
+-				return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.NewPath, parentFs, err)
++				return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.NewPath, layerFs, err)
+ 			}
+-			ic.NewPath="/"+newpath
++			ic.NewPath=newpath
+ 		}
+-		switch ic.Change {
+-		case zfs.Created:
+-			changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeAdd})
+-		case zfs.Removed:
+-			changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
+-		case zfs.Modified:
+-			changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeModify})
+-		case zfs.Renamed:
+-			changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
+-			changes=append(changes,archive.Change{Path:ic.NewPath,Kind:archive.ChangeAdd})
++		if ic.Type==zfs.Directory {
++			switch ic.Change {
++			case zfs.Modified:
++				dirChanges,err:=shallowFileOnlyChangesDirs("/"+ic.Path,filepath.Join(layerFs,ic.Path), filepath.Join(parentFs,ic.Path))
++				if err != nil {
++					return nil, err
++				}
++				mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:"/"+ic.Path,Kind:archive.ChangeModify})
++				mergeChanges(&changes,&pathStateChangeIndex,dirChanges...)
++			case zfs.Created:
++				if _, present := pathStateChangeIndex["/"+ic.Path]; ! present {
++					layerChanges,err:=archive.ChangesDirs(filepath.Join(layerFs,ic.Path), "")
++					if err != nil {
++						return nil, err
++					}
++					for i, change:= range layerChanges {
++						changePath := filepath.Join(ic.Path,change.Path)
++						layerChanges[i].Path="/"+changePath
++					}
++					mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:"/"+ic.Path,Kind:archive.ChangeAdd})
++					mergeChanges(&changes,&pathStateChangeIndex,layerChanges...)
++				}
++			case zfs.Removed:
++				ic.Path="/"+ic.Path
++				mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
++			case zfs.Renamed:
++				ic.Path="/"+ic.Path
++				ic.NewPath="/"+ic.NewPath
++				mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
++				mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:ic.NewPath,Kind:archive.ChangeAdd})
++			}
++		} else if _, present := pathStateChangeIndex["/"+filepath.Dir(ic.Path)] ; ! present {
++			ic.Path="/"+ic.Path
++			if ic.NewPath!="" {
++				ic.NewPath="/"+ic.NewPath
++			}
++			switch ic.Change {
++			case zfs.Created:
++				mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:ic.Path,Kind:archive.ChangeAdd})
++			case zfs.Removed:
++				mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
++			case zfs.Modified:
++				mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:ic.Path,Kind:archive.ChangeModify})
++			case zfs.Renamed:
++				mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
++				mergeChanges(&changes,&pathStateChangeIndex,archive.Change{Path:ic.NewPath,Kind:archive.ChangeAdd})
++			}
+ 		}
+ 	}
+ 	log.Debugf("[zfs] done comparing %s", id)
++	return changes, nil
++}
++
++func (d *Driver) Diff(id, parent string) (archive.Archive, error) {
++	log.Debugf("[zfs] diffing %s to %s", id, parent)
++	layerFs, err := d.Get(id, "")
++	if err != nil {
++		return nil, err
++	}
++
++	if parent == "" {
++		log.Debugf("[zfs] creating archive from scratch")
++		archive, err := archive.Tar(layerFs, archive.Uncompressed)
++		if err != nil {
++			d.Put(id)
++			return nil, err
++		}
++		return ioutils.NewReadCloserWrapper(archive, func() error {
++			err := archive.Close()
++			d.Put(id)
++			log.Debugf("[zfs] done diffing %s", id)
++			return err
++		}), nil
++	}
++	changes, err := d.makeChangeList(id, layerFs, parent)
++	if err != nil {
++		d.Put(id)
++		return nil, err
++	}
+ 	archive, err := archive.ExportChanges(layerFs, changes)
+ 	if err != nil {
++		d.Put(id)
+ 		return nil, err
+ 	}
+ 	log.Debugf("[zfs] done exporting changes to %s", id)
+@@ -453,58 +641,12 @@ func (d *Driver) Changes(id, parent string) ([]archive.Change, error) {
+ 	}
+ 	defer d.Put(id)
+ 
+-	if parent != "" {
+-		name := d.ZfsPath(id)
+-		dataset := zfs.Dataset{Name: name}
+-
+-		// XXX: for no apparent reason whatsoever, ZFS wants us to have the parent mounted
+-		parentFs, err := d.Get(parent, "")
+-		if err != nil {
+-			return nil, err
+-		}
+-		defer d.Put(parent)
+-
+-		origin, err := dataset.GetProperty("origin")
+-		if err != nil {
+-			return nil, fmt.Errorf("error getting origin of %s: %v", id, err)
+-		}
+-		inodeChanges, err := dataset.Diff(origin)
+-		if err != nil {
+-			return nil, fmt.Errorf("error comparing %s to %s: %v", id, parent, err)
+-		}
++	if parent == "" {
++		log.Debugf("[zfs] no parent, falling back to general case")
+ 
+-		var changes []archive.Change
+-		for _, ic := range inodeChanges {
+-			path,err := filepath.Rel(layerFs,ic.Path)
+-			if err != nil {
+-				return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.Path, parentFs, err)
+-			}
+-			ic.Path="/"+path
+-			if ic.NewPath!="" {
+-				newpath,err := filepath.Rel(layerFs,ic.NewPath)
+-				if err != nil {
+-					return nil, fmt.Errorf("error diff filename output: %s with base %s: %v", ic.NewPath, parentFs, err)
+-				}
+-				ic.NewPath="/"+newpath
+-			}
+-			switch ic.Change {
+-			case zfs.Created:
+-				changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeAdd})
+-			case zfs.Removed:
+-				changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
+-			case zfs.Modified:
+-				changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeModify})
+-			case zfs.Renamed:
+-				changes=append(changes,archive.Change{Path:ic.Path,Kind:archive.ChangeDelete})
+-				changes=append(changes,archive.Change{Path:ic.NewPath,Kind:archive.ChangeAdd})
+-			}
+-		}
+-		log.Debugf("[zfs] done comparing %s", id)
+-		return changes, nil
++		return archive.ChangesDirs(layerFs, "")
+ 	}
+-	log.Debugf("[zfs] no parent, falling back to general case")
+-
+-	return archive.ChangesDirs(layerFs, "")
++	return d.makeChangeList(id, layerFs, parent)
+ }
+ 
+ func (d *Driver) ApplyDiff(id, parent string, diff archive.ArchiveReader) (size int64, err error) {
+
